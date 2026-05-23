@@ -8,7 +8,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.louietyj.wristspacer.wear"
+        applicationId = "com.louietyj.wristspacer"
         minSdk = 30
         targetSdk = 35
         versionCode = 1

@@ -11,19 +11,26 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
+        <!-- Declare this as a standalone Wear OS app (not a phone companion sideload).
+             Required on Wear OS 3+ for the WearableListenerService to start correctly. -->
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true" />
+
         <!--
             WearableListenerService: receives /next_event DataItems pushed from the phone.
-            The system binds it automatically when a matching DataItem arrives.
+            Path filter removed from manifest to avoid Wear OS 4 GMS delivery failures;
+            we filter by path in onDataChanged() instead.
         -->
         <service
             android:name=".PhoneDataListenerService"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
                 <data
                     android:scheme="wear"
-                    android:host="*"
-                    android:pathPrefix="/next_event" />
+                    android:host="*" />
             </intent-filter>
         </service>
 
