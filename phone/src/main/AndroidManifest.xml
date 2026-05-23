@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <!-- Exempts this app from Doze / battery optimisation so the foreground
+         service and Data Layer pushes aren't deferred while the phone is idle. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Wearable Data Layer -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 

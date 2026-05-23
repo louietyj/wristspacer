@@ -1,7 +1,11 @@
 ﻿package com.louietyj.wristspacer.phone
 
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
@@ -43,10 +47,34 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
+                    var batteryExempt by remember { mutableStateOf(isBatteryExempt()) }
+
+                    // Refresh on every resume so the status row updates after the
+                    // user returns from the system battery settings screen.
+                    DisposableEffect(Unit) {
+                        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                                batteryExempt = isBatteryExempt()
+                                AppState.updateShizukuReady(ShizukuHelper.isReady())
+                            }
+                        }
+                        lifecycle.addObserver(observer)
+                        onDispose { lifecycle.removeObserver(observer) }
+                    }
+
                     StatusScreen(
+                        batteryExempt = batteryExempt,
                         onStartClick = { SmartspaceBridgeService.start(this) },
                         onStopClick  = { SmartspaceBridgeService.stop(this) },
                         onGrantShizuku = { ShizukuHelper.requestPermission() },
+                        onRequestBatteryExempt = {
+                            startActivity(
+                                Intent(
+                                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    Uri.parse("package:$packageName")
+                                )
+                            )
+                        },
                     )
                 }
             }
@@ -57,13 +85,19 @@ class MainActivity : ComponentActivity() {
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
         super.onDestroy()
     }
+
+    private fun isBatteryExempt(): Boolean =
+        (getSystemService(POWER_SERVICE) as PowerManager)
+            .isIgnoringBatteryOptimizations(packageName)
 }
 
 @Composable
 fun StatusScreen(
+    batteryExempt: Boolean,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
     onGrantShizuku: () -> Unit,
+    onRequestBatteryExempt: () -> Unit,
 ) {
     val status by AppState.bridgeStatus.collectAsStateWithLifecycle()
     val shizukuReady by AppState.shizukuReady.collectAsStateWithLifecycle()
@@ -85,6 +119,8 @@ fun StatusScreen(
         HorizontalDivider()
 
         StatusRow(label = "Shizuku", ok = shizukuReady)
+        StatusRow(label = "Battery", ok = batteryExempt,
+            detail = if (!batteryExempt) "not exempted" else null)
         StatusRow(
             label = "Bridge",
             ok = isRunning,
@@ -131,6 +167,10 @@ fun StatusScreen(
         if (!shizukuReady) {
             Button(onClick = onGrantShizuku, modifier = Modifier.fillMaxWidth()) {
                 Text("Grant Shizuku Permission")
+            }
+        } else if (!batteryExempt) {
+            Button(onClick = onRequestBatteryExempt, modifier = Modifier.fillMaxWidth()) {
+                Text("Disable Battery Optimisation")
             }
         } else if (!isRunning) {
             Button(onClick = onStartClick, modifier = Modifier.fillMaxWidth()) {
