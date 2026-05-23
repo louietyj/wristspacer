@@ -65,7 +65,12 @@ class SmartspaceBridgeService : Service() {
             }
         }
 
-        // Step 2: if VMRuntime bypass failed, try via Shizuku
+        // Step 2: proactively apply the hidden_api_policy=1 fallback via Shizuku.
+        // The VMRuntime double-reflection bypass can fail on Android 16; this is the
+        // belt-and-suspenders approach that doesn't require a reboot to take effect.
+        ShizukuHelper.applyHiddenApiPolicyViaShizuku()
+
+        // Step 3: confirm SmartspaceManager class is visible
         try {
             Class.forName("android.app.smartspace.SmartspaceManager")
         } catch (e: ClassNotFoundException) {
@@ -73,14 +78,10 @@ class SmartspaceBridgeService : Service() {
             return
         }
 
-        // Step 3: get the SmartspaceManager instance
+        // Step 4: get the SmartspaceManager instance
         val manager: Any = getSystemService("smartspace") ?: run {
-            // Try a second time after applying the Shizuku policy fallback
-            ShizukuHelper.applyHiddenApiPolicyViaShizuku()
-            getSystemService("smartspace")
-        } ?: run {
-            fail("getSystemService(smartspace) returned null — hidden API policy may be blocking it.\n" +
-                 "Run: adb shell settings put global hidden_api_policy 1")
+            fail("getSystemService(smartspace) returned null even after hidden_api_policy=1.\n" +
+                 "Run manually: adb shell settings put global hidden_api_policy 1")
             return
         }
 
@@ -117,12 +118,23 @@ class SmartspaceBridgeService : Service() {
         val listenerProxy = Proxy.newProxyInstance(
             listenerInterface.classLoader,
             arrayOf(listenerInterface)
-        ) { _, method, args ->
-            if (method.name == "onTargetsAvailable" && args != null) {
-                @Suppress("UNCHECKED_CAST")
-                processTargets(args[0] as List<Any?>)
+        ) { proxy, method, args ->
+            // SmartspaceSession stores the listener in an ArrayMap keyed by hashCode,
+            // so the proxy MUST return a valid int from hashCode() — null causes an NPE
+            // when the runtime tries to unbox it to a primitive int.
+            when (method.name) {
+                "onTargetsAvailable" -> {
+                    if (args != null) {
+                        @Suppress("UNCHECKED_CAST")
+                        processTargets(args[0] as List<Any?>)
+                    }
+                    null
+                }
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals"   -> proxy === args?.firstOrNull()
+                "toString" -> "WristspacerListener@${Integer.toHexString(System.identityHashCode(proxy))}"
+                else       -> null
             }
-            null
         }
 
         val executor = Executors.newSingleThreadExecutor()
@@ -144,9 +156,12 @@ class SmartspaceBridgeService : Service() {
     // -------------------------------------------------------------------------
 
     /**
-     * Finds the first FEATURE_CALENDAR target (featureType == 2) and extracts
-     * the event title and subtitle from its headerAction. Pushes to the watch.
-     * If no calendar target is present, clears the watch complication.
+     * Finds the first FEATURE_CALENDAR target (featureType == 2) and extracts the event
+     * title and time. SmartspaceTarget layout for calendar events:
+     *   baseAction.title    = event title  (e.g. "Weekly Standup")
+     *   baseAction.subtitle = location / organiser (optional)
+     *   headerAction.title  = time string  (e.g. "10:00 AM") — often empty on some builds
+     * We try baseAction first, then headerAction, and log everything for diagnostics.
      */
     private fun processTargets(targets: List<Any?>) {
         val calendarTarget = targets.firstOrNull { target ->
@@ -163,14 +178,28 @@ class SmartspaceBridgeService : Service() {
             return
         }
 
-        val headerAction = calendarTarget.javaClass
-            .getMethod("getHeaderAction")
-            .invoke(calendarTarget) ?: return
+        // Data lives in templateData (Android 12+), not in the action title/subtitle fields.
+        // Path: getTemplateData() → getPrimaryItem() → getText() → getText()  (event title)
+        //       getTemplateData() → getSubtitleItem() → getText() → getText() (time range)
+        val templateData = runCatching {
+            calendarTarget.javaClass.getMethod("getTemplateData").invoke(calendarTarget)
+        }.getOrNull()
 
-        val title = headerAction.javaClass.getMethod("getTitle").invoke(headerAction)
-            ?.toString() ?: return
-        val subtitle = headerAction.javaClass.getMethod("getSubtitle").invoke(headerAction)
-            ?.toString() ?: ""
+        fun textFromSubItem(subItem: Any?): String? = runCatching {
+            val textObj = subItem?.javaClass?.getMethod("getText")?.invoke(subItem) ?: return@runCatching null
+            textObj.javaClass.getMethod("getText").invoke(textObj)?.toString()?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+
+        val primaryItem  = runCatching { templateData?.javaClass?.getMethod("getPrimaryItem")?.invoke(templateData) }.getOrNull()
+        val subtitleItem = runCatching { templateData?.javaClass?.getMethod("getSubtitleItem")?.invoke(templateData) }.getOrNull()
+
+        val title    = textFromSubItem(primaryItem)
+        val subtitle = textFromSubItem(subtitleItem) ?: ""
+
+        if (title.isNullOrEmpty()) {
+            Log.w(TAG, "Calendar target present but could not extract title from templateData — skipping")
+            return
+        }
 
         Log.d(TAG, "Calendar event: '$title' / '$subtitle'")
         val event = CalendarEvent(title = title, subtitle = subtitle)
