@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:label="Wristspacer"
+        android:icon="@android:drawable/ic_dialog_info"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <!--
+            WearableListenerService: receives /next_event DataItems pushed from the phone.
+            The system binds it automatically when a matching DataItem arrives.
+        -->
+        <service
+            android:name=".PhoneDataListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
+                <data
+                    android:scheme="wear"
+                    android:host="*"
+                    android:pathPrefix="/next_event" />
+            </intent-filter>
+        </service>
+
+        <!--
+            ComplicationDataSourceService: provides the next-event complication to watch faces.
+
+            BIND_COMPLICATION_PROVIDER: only the Wear OS system may bind to this service.
+            SUPPORTED_TYPES: SHORT_TEXT for small slots, LONG_TEXT for wide slots.
+            UPDATE_PERIOD_SECONDS=0: updates are push-driven via requestUpdateAll()
+                                     from PhoneDataListenerService; no polling needed.
+        -->
+        <service
+            android:name=".NextEventComplicationService"
+            android:label="Work Calendar Event"
+            android:exported="true"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SHORT_TEXT,LONG_TEXT" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
+        </service>
+
+    </application>
+
+</manifest>
