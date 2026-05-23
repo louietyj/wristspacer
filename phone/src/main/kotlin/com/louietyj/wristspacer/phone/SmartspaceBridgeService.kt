@@ -164,52 +164,79 @@ class SmartspaceBridgeService : Service() {
      * We try baseAction first, then headerAction, and log everything for diagnostics.
      */
     private fun processTargets(targets: List<Any?>) {
-        val calendarTarget = targets.firstOrNull { target ->
-            target?.let {
-                val featureType = it.javaClass.getMethod("getFeatureType").invoke(it) as? Int
-                featureType == FEATURE_CALENDAR
-            } ?: false
+        // Collect all FEATURE_CALENDAR targets with their extracted titles
+        data class Candidate(val target: Any, val title: String, val subtitle: String)
+
+        val calendarCandidates = targets.mapNotNull { target ->
+            target ?: return@mapNotNull null
+            val featureType = runCatching {
+                target.javaClass.getMethod("getFeatureType").invoke(target) as? Int
+            }.getOrNull()
+            if (featureType != FEATURE_CALENDAR) return@mapNotNull null
+
+            val templateData = runCatching {
+                target.javaClass.getMethod("getTemplateData").invoke(target)
+            }.getOrNull()
+
+            val title    = textFromSubItem(templateData, "getPrimaryItem")  ?: return@mapNotNull null
+            val subtitle = textFromSubItem(templateData, "getSubtitleItem") ?: ""
+            Candidate(target, title, subtitle)
         }
 
-        // Fall back to the first available target when there's no upcoming calendar event.
-        val target = calendarTarget ?: targets.firstOrNull { it != null }
-        val isCalendar = (target === calendarTarget) && calendarTarget != null
+        // Remove [Mirror] X when X also exists — then pick the first remaining candidate.
+        val dedupedCalendar = if (calendarCandidates.isNotEmpty()) {
+            val nonMirroredTitles = calendarCandidates
+                .map { it.title }
+                .filter { !it.startsWith("[Mirror]", ignoreCase = true) }
+                .toSet()
+            calendarCandidates.filter { c ->
+                val stripped = c.title.removePrefix("[Mirror] ").removePrefix("[mirror] ")
+                // Keep if it's not a mirror, OR if there's no non-mirrored twin
+                !c.title.startsWith("[Mirror]", ignoreCase = true) || stripped !in nonMirroredTitles
+            }
+        } else emptyList()
 
-        if (target == null) {
-            Log.d(TAG, "No Smartspace targets — clearing watch complication")
-            AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
-            pushToWatch(null)
+        val chosen: Candidate? = dedupedCalendar.firstOrNull()
+
+        if (chosen == null) {
+            // No calendar targets — fall back to the first available Smartspace target
+            val fallback = targets.firstOrNull { it != null } ?: run {
+                Log.d(TAG, "No Smartspace targets — clearing watch complication")
+                AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
+                pushToWatch(null)
+                return
+            }
+            val templateData = runCatching {
+                fallback.javaClass.getMethod("getTemplateData").invoke(fallback)
+            }.getOrNull()
+            val title    = textFromSubItem(templateData, "getPrimaryItem")
+            val subtitle = textFromSubItem(templateData, "getSubtitleItem") ?: ""
+            if (title.isNullOrEmpty()) {
+                Log.w(TAG, "Fallback target has no extractable title — clearing")
+                pushToWatch(null)
+                return
+            }
+            Log.d(TAG, "Fallback event: '$title' / '$subtitle'")
+            val event = CalendarEvent(title = title, subtitle = subtitle)
+            AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
+            pushToWatch(event)
             return
         }
 
-        // Data lives in templateData (Android 12+), not in the action title/subtitle fields.
-        // Path: getTemplateData() → getPrimaryItem() → getText() → getText()  (event title)
-        //       getTemplateData() → getSubtitleItem() → getText() → getText() (time range)
-        val templateData = runCatching {
-            target.javaClass.getMethod("getTemplateData").invoke(target)
-        }.getOrNull()
-
-        fun textFromSubItem(subItem: Any?): String? = runCatching {
-            val textObj = subItem?.javaClass?.getMethod("getText")?.invoke(subItem) ?: return@runCatching null
-            textObj.javaClass.getMethod("getText").invoke(textObj)?.toString()?.takeIf { it.isNotEmpty() }
-        }.getOrNull()
-
-        val primaryItem  = runCatching { templateData?.javaClass?.getMethod("getPrimaryItem")?.invoke(templateData) }.getOrNull()
-        val subtitleItem = runCatching { templateData?.javaClass?.getMethod("getSubtitleItem")?.invoke(templateData) }.getOrNull()
-
-        val title    = textFromSubItem(primaryItem)
-        val subtitle = textFromSubItem(subtitleItem) ?: ""
-
-        if (title.isNullOrEmpty()) {
-            Log.w(TAG, "Target present but could not extract title from templateData — skipping")
-            return
-        }
-
-        Log.d(TAG, "${if (isCalendar) "Calendar" else "Fallback"} event: '$title' / '$subtitle'")
-        val event = CalendarEvent(title = title, subtitle = subtitle)
+        Log.d(TAG, "Calendar event: '${chosen.title}' / '${chosen.subtitle}'")
+        val event = CalendarEvent(title = chosen.title, subtitle = chosen.subtitle)
         AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
         pushToWatch(event)
     }
+
+    /** Extracts text from templateData → subItemGetter() → getText() → getText(). */
+    private fun textFromSubItem(templateData: Any?, subItemGetter: String): String? = runCatching {
+        val subItem = templateData?.javaClass?.getMethod(subItemGetter)?.invoke(templateData)
+            ?: return@runCatching null
+        val textObj = subItem.javaClass.getMethod("getText").invoke(subItem)
+            ?: return@runCatching null
+        textObj.javaClass.getMethod("getText").invoke(textObj)?.toString()?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
 
     // -------------------------------------------------------------------------
     // Watch sync via DataLayer

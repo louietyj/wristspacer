@@ -20,6 +20,13 @@ class PhoneWearListenerService : WearableListenerService() {
         if (event.path != DataKeys.PATH_REQUEST_UPDATE) return
         Log.d(TAG, "Watch requested update (node=${event.sourceNodeId})")
 
+        // Wake the bridge if it isn't running — covers the case where the phone
+        // was rebooted or the service was killed before the watch sent this message.
+        if (AppState.bridgeStatus.value is BridgeStatus.Stopped) {
+            Log.d(TAG, "Bridge not running — starting it now")
+            SmartspaceBridgeService.start(this)
+        }
+
         val currentEvent = (AppState.bridgeStatus.value as? BridgeStatus.Running)?.event
 
         try {
