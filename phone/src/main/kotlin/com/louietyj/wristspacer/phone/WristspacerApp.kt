@@ -22,12 +22,15 @@ class WristspacerApp : Application() {
      */
     private fun exemptHiddenApis() {
         try {
-            // getDeclaredMethod is public API — we use it to reach VMRuntime without triggering
-            // the restriction check that fires on direct calls to hidden classes.
+            // Kotlin doesn't allow parameterized array types in ::class.java literals (type erasure),
+            // so we obtain Class<?>[] and String[] class objects via empty array instances.
+            val classArrayClass = emptyArray<Class<*>>().javaClass   // Class<?>[]
+            val stringArrayClass = emptyArray<String>().javaClass    // String[]
+
             val getDeclaredMethod = Class::class.java.getDeclaredMethod(
                 "getDeclaredMethod",
                 String::class.java,
-                Array<Class<*>>::class.java
+                classArrayClass
             )
 
             val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
@@ -41,7 +44,7 @@ class WristspacerApp : Application() {
             val setHiddenApiExemptions = (getDeclaredMethod.invoke(
                 vmRuntimeClass,
                 "setHiddenApiExemptions",
-                arrayOf(Array<String>::class.java)
+                arrayOf(stringArrayClass)   // parameterTypes = [String[].class]
             ) as Method).apply { isAccessible = true }
 
             // "L" exempts all classes (all descriptors start with L in JVM notation)

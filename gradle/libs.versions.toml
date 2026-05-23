@@ -29,7 +29,7 @@ shizuku-provider = { group = "dev.rikka.shizuku", name = "provider", version.ref
 play-services-wearable = { group = "com.google.android.gms", name = "play-services-wearable", version.ref = "wearable" }
 
 # Wear OS complications
-watchface-complications-datasource-ktx = { group = "androidx.wear.watchface", name = "watchface-complications-datasource-ktx", version.ref = "watchfaceComplications" }
+watchface-complications-datasource-ktx = { group = "androidx.wear.watchface", name = "watchface-complications-data-source-ktx", version.ref = "watchfaceComplications" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
