@@ -11,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -76,6 +77,16 @@ class MainActivity : ComponentActivity() {
                             )
                         },
                     )
+
+                    // Auto-start the bridge once all preconditions are satisfied,
+                    // so the user never has to tap the button on a normal launch.
+                    val status by AppState.bridgeStatus.collectAsStateWithLifecycle()
+                    val shizukuReadyState by AppState.shizukuReady.collectAsStateWithLifecycle()
+                    LaunchedEffect(shizukuReadyState, batteryExempt, status) {
+                        if (shizukuReadyState && batteryExempt && status is BridgeStatus.Stopped) {
+                            SmartspaceBridgeService.start(this@MainActivity)
+                        }
+                    }
                 }
             }
         }

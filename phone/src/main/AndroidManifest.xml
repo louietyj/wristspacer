@@ -11,6 +11,7 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Exempts this app from Doze / battery optimisation so the foreground
          service and Data Layer pushes aren't deferred while the phone is idle. -->
@@ -60,6 +61,16 @@
                     android:host="*" />
             </intent-filter>
         </service>
+
+        <!-- Auto-starts the bridge after phone reboot -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 

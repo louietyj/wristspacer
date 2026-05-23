@@ -171,8 +171,12 @@ class SmartspaceBridgeService : Service() {
             } ?: false
         }
 
-        if (calendarTarget == null) {
-            Log.d(TAG, "No calendar target — clearing watch complication")
+        // Fall back to the first available target when there's no upcoming calendar event.
+        val target = calendarTarget ?: targets.firstOrNull { it != null }
+        val isCalendar = (target === calendarTarget) && calendarTarget != null
+
+        if (target == null) {
+            Log.d(TAG, "No Smartspace targets — clearing watch complication")
             AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
             pushToWatch(null)
             return
@@ -182,7 +186,7 @@ class SmartspaceBridgeService : Service() {
         // Path: getTemplateData() → getPrimaryItem() → getText() → getText()  (event title)
         //       getTemplateData() → getSubtitleItem() → getText() → getText() (time range)
         val templateData = runCatching {
-            calendarTarget.javaClass.getMethod("getTemplateData").invoke(calendarTarget)
+            target.javaClass.getMethod("getTemplateData").invoke(target)
         }.getOrNull()
 
         fun textFromSubItem(subItem: Any?): String? = runCatching {
@@ -197,11 +201,11 @@ class SmartspaceBridgeService : Service() {
         val subtitle = textFromSubItem(subtitleItem) ?: ""
 
         if (title.isNullOrEmpty()) {
-            Log.w(TAG, "Calendar target present but could not extract title from templateData — skipping")
+            Log.w(TAG, "Target present but could not extract title from templateData — skipping")
             return
         }
 
-        Log.d(TAG, "Calendar event: '$title' / '$subtitle'")
+        Log.d(TAG, "${if (isCalendar) "Calendar" else "Fallback"} event: '$title' / '$subtitle'")
         val event = CalendarEvent(title = title, subtitle = subtitle)
         AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
         pushToWatch(event)
