@@ -37,10 +37,13 @@ object AppState {
     }
 }
 
-/** Keys used in the Wearable DataLayer DataMap. */
+/** Keys used in the Wearable DataLayer DataMap and MessageClient. */
 object DataKeys {
     const val PATH = "/next_event"
     const val KEY_TITLE = "title"
     const val KEY_SUBTITLE = "subtitle"
     const val KEY_TIMESTAMP = "timestamp"
+
+    /** MessageClient path the watch sends to request an immediate push. */
+    const val PATH_REQUEST_UPDATE = "/request_update"
 }
