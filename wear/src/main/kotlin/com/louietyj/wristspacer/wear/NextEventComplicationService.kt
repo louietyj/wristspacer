@@ -8,6 +8,7 @@ import androidx.wear.watchface.complications.datasource.SuspendingComplicationDa
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.Wearable
 import com.louietyj.wristspacer.wear.PhoneDataListenerService.Companion.KEY_SUBTITLE
+import com.louietyj.wristspacer.wear.PhoneDataListenerService.Companion.KEY_TIMESTAMP
 import com.louietyj.wristspacer.wear.PhoneDataListenerService.Companion.KEY_TITLE
 import com.louietyj.wristspacer.wear.PhoneDataListenerService.Companion.PREFS_NAME
 import kotlinx.coroutines.CoroutineScope
@@ -23,8 +24,10 @@ import kotlinx.coroutines.launch
  *   SHORT_TEXT  — event title only (fits small corner/side slots)
  *   LONG_TEXT   — subtitle • title (fits wide slots)
  *
- * Updates are push-driven from the phone (UPDATE_PERIOD_SECONDS=0).
- * The DataLayer listener calls requestUpdateAll() whenever new data arrives.
+ * Normal updates are push-driven from the phone (minute-level Smartspace ticks).
+ * UPDATE_PERIOD_SECONDS=300 acts as a watchdog: if the phone bridge dies, the
+ * 5-min system tick triggers onComplicationRequest, which detects stale data
+ * (last push > STALE_THRESHOLD) and sends /request_update to wake the bridge.
  */
 class NextEventComplicationService : SuspendingComplicationDataSourceService() {
 
@@ -43,22 +46,7 @@ class NextEventComplicationService : SuspendingComplicationDataSourceService() {
     override fun onComplicationActivated(complicationInstanceId: Int, type: ComplicationType) {
         super.onComplicationActivated(complicationInstanceId, type)
         Log.d(TAG, "Complication activated ($complicationInstanceId) — requesting immediate update")
-        scope.launch {
-            try {
-                val nodes = Tasks.await(
-                    Wearable.getNodeClient(this@NextEventComplicationService).connectedNodes
-                )
-                nodes.forEach { node ->
-                    Tasks.await(
-                        Wearable.getMessageClient(this@NextEventComplicationService)
-                            .sendMessage(node.id, PATH_REQUEST_UPDATE, ByteArray(0))
-                    )
-                    Log.d(TAG, "Sent request_update to ${node.displayName}")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to send request_update: ${e.message}")
-            }
-        }
+        scope.launch { sendRequestUpdate() }
     }
 
     override fun getPreviewData(type: ComplicationType): ComplicationData? =
@@ -69,9 +57,18 @@ class NextEventComplicationService : SuspendingComplicationDataSourceService() {
         }
 
     override suspend fun onComplicationRequest(request: ComplicationRequest): ComplicationData? {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs    = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val title    = prefs.getString(KEY_TITLE, "") ?: ""
         val subtitle = prefs.getString(KEY_SUBTITLE, "") ?: ""
+        val lastTs   = prefs.getLong(KEY_TIMESTAMP, 0L)
+
+        // Watchdog: if the last push is stale the bridge may be dead — ping the phone.
+        // This runs on every 5-min system tick, covering the crash/kill recovery case.
+        val ageMs = System.currentTimeMillis() - lastTs
+        if (ageMs > STALE_THRESHOLD_MS) {
+            Log.d(TAG, "Data stale (${ageMs / 1000}s) — sending request_update to phone")
+            scope.launch { sendRequestUpdate() }
+        }
 
         Log.d(TAG, "onComplicationRequest type=${request.complicationType} title='$title'")
 
@@ -94,6 +91,23 @@ class NextEventComplicationService : SuspendingComplicationDataSourceService() {
     // Helpers
     // -------------------------------------------------------------------------
 
+    private fun sendRequestUpdate() {
+        try {
+            val nodes = Tasks.await(
+                Wearable.getNodeClient(this).connectedNodes
+            )
+            nodes.forEach { node ->
+                Tasks.await(
+                    Wearable.getMessageClient(this)
+                        .sendMessage(node.id, PATH_REQUEST_UPDATE, ByteArray(0))
+                )
+                Log.d(TAG, "Sent request_update to ${node.displayName}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to send request_update: ${e.message}")
+        }
+    }
+
     private fun shortText(title: String): ShortTextComplicationData =
         ShortTextComplicationData.Builder(
             text = PlainComplicationText.Builder(title).build(),
@@ -113,5 +127,7 @@ class NextEventComplicationService : SuspendingComplicationDataSourceService() {
     companion object {
         private const val TAG = "NextEventComplication"
         private const val PATH_REQUEST_UPDATE = "/request_update"
+        /** If the last push is older than this, the bridge is considered dead and pinged. */
+        private const val STALE_THRESHOLD_MS = 3 * 60 * 1000L  // 3 minutes
     }
 }
