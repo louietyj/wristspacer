@@ -164,6 +164,22 @@ class SmartspaceBridgeService : Service() {
      * We try baseAction first, then headerAction, and log everything for diagnostics.
      */
     private fun processTargets(targets: List<Any?>) {
+        // Diagnostic: log every target's feature type and template data type so we can
+        // understand what Smartspace is actually returning when "none" appears.
+        targets.forEachIndexed { i, target ->
+            target ?: return@forEachIndexed
+            val featureType = runCatching {
+                target.javaClass.getMethod("getFeatureType").invoke(target)
+            }.getOrNull()
+            val templateType = runCatching {
+                target.javaClass.getMethod("getTemplateData").invoke(target)?.javaClass?.simpleName
+            }.getOrNull() ?: "null"
+            val headerTitle = textFromAction(target, "getHeaderAction")
+            val baseTitle   = textFromAction(target, "getBaseAction")
+            Log.d(TAG, "Target[$i] featureType=$featureType templateData=$templateType " +
+                    "headerTitle='$headerTitle' baseTitle='$baseTitle'")
+        }
+
         // Collect all FEATURE_CALENDAR targets with their extracted titles
         data class Candidate(val target: Any, val title: String, val subtitle: String)
 
@@ -199,7 +215,9 @@ class SmartspaceBridgeService : Service() {
         val chosen: Candidate? = dedupedCalendar.firstOrNull()
 
         if (chosen == null) {
-            // No calendar targets — fall back to the first available Smartspace target
+            // No calendar targets — fall back to the first available Smartspace target.
+            // Try templateData.getPrimaryItem() first, then headerAction/baseAction titles
+            // (commute and other non-calendar cards store their text there).
             val fallback = targets.firstOrNull { it != null } ?: run {
                 Log.d(TAG, "No Smartspace targets — clearing watch complication")
                 AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
@@ -209,8 +227,13 @@ class SmartspaceBridgeService : Service() {
             val templateData = runCatching {
                 fallback.javaClass.getMethod("getTemplateData").invoke(fallback)
             }.getOrNull()
-            val title    = textFromSubItem(templateData, "getPrimaryItem")
-            val subtitle = textFromSubItem(templateData, "getSubtitleItem") ?: ""
+            val title = textFromSubItem(templateData, "getPrimaryItem")
+                ?: textFromAction(fallback, "getHeaderAction")
+                ?: textFromAction(fallback, "getBaseAction")
+            val subtitle = textFromSubItem(templateData, "getSubtitleItem")
+                ?: textFromActionSubtitle(fallback, "getHeaderAction")
+                ?: textFromActionSubtitle(fallback, "getBaseAction")
+                ?: ""
             if (title.isNullOrEmpty()) {
                 Log.w(TAG, "Fallback target has no extractable title — clearing")
                 pushToWatch(null)
@@ -236,6 +259,20 @@ class SmartspaceBridgeService : Service() {
         val textObj = subItem.javaClass.getMethod("getText").invoke(subItem)
             ?: return@runCatching null
         textObj.javaClass.getMethod("getText").invoke(textObj)?.toString()?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
+
+    /** Extracts the title string from a SmartspaceAction on the target (header or base). */
+    private fun textFromAction(target: Any, actionGetter: String): String? = runCatching {
+        val action = target.javaClass.getMethod(actionGetter).invoke(target)
+            ?: return@runCatching null
+        action.javaClass.getMethod("getTitle").invoke(action)?.toString()?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
+
+    /** Extracts the subtitle string from a SmartspaceAction on the target (header or base). */
+    private fun textFromActionSubtitle(target: Any, actionGetter: String): String? = runCatching {
+        val action = target.javaClass.getMethod(actionGetter).invoke(target)
+            ?: return@runCatching null
+        action.javaClass.getMethod("getSubtitle").invoke(action)?.toString()?.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
     // -------------------------------------------------------------------------
