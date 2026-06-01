@@ -215,34 +215,33 @@ class SmartspaceBridgeService : Service() {
         val chosen: Candidate? = dedupedCalendar.firstOrNull()
 
         if (chosen == null) {
-            // No calendar targets — fall back to the first available Smartspace target.
-            // Try templateData.getPrimaryItem() first, then headerAction/baseAction titles
-            // (commute and other non-calendar cards store their text there).
-            val fallback = targets.firstOrNull { it != null } ?: run {
-                Log.d(TAG, "No Smartspace targets — clearing watch complication")
+            // No calendar targets — iterate all targets until one yields an extractable title.
+            // Some targets (e.g. featureType=72 placeholders) have null templateData and null
+            // action titles; skipping them lets us reach the real content further down the list.
+            val fallbackEvent = targets.asSequence().filterNotNull().mapNotNull { target ->
+                val templateData = runCatching {
+                    target.javaClass.getMethod("getTemplateData").invoke(target)
+                }.getOrNull()
+                val title = textFromSubItem(templateData, "getPrimaryItem")
+                    ?: textFromAction(target, "getHeaderAction")
+                    ?: textFromAction(target, "getBaseAction")
+                if (title.isNullOrEmpty()) return@mapNotNull null
+                val subtitle = textFromSubItem(templateData, "getSubtitleItem")
+                    ?: textFromActionSubtitle(target, "getHeaderAction")
+                    ?: textFromActionSubtitle(target, "getBaseAction")
+                    ?: ""
+                CalendarEvent(title = title, subtitle = subtitle)
+            }.firstOrNull()
+
+            if (fallbackEvent == null) {
+                Log.w(TAG, "No target yielded an extractable title — clearing")
                 AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
                 pushToWatch(null)
                 return
             }
-            val templateData = runCatching {
-                fallback.javaClass.getMethod("getTemplateData").invoke(fallback)
-            }.getOrNull()
-            val title = textFromSubItem(templateData, "getPrimaryItem")
-                ?: textFromAction(fallback, "getHeaderAction")
-                ?: textFromAction(fallback, "getBaseAction")
-            val subtitle = textFromSubItem(templateData, "getSubtitleItem")
-                ?: textFromActionSubtitle(fallback, "getHeaderAction")
-                ?: textFromActionSubtitle(fallback, "getBaseAction")
-                ?: ""
-            if (title.isNullOrEmpty()) {
-                Log.w(TAG, "Fallback target has no extractable title — clearing")
-                pushToWatch(null)
-                return
-            }
-            Log.d(TAG, "Fallback event: '$title' / '$subtitle'")
-            val event = CalendarEvent(title = title, subtitle = subtitle)
-            AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
-            pushToWatch(event)
+            Log.d(TAG, "Fallback event: '${fallbackEvent.title}' / '${fallbackEvent.subtitle}'")
+            AppState.updateBridgeStatus(BridgeStatus.Running(event = fallbackEvent))
+            pushToWatch(fallbackEvent)
             return
         }
 
