@@ -56,6 +56,8 @@ class SmartspaceBridgeService : Service() {
     // -------------------------------------------------------------------------
 
     private fun setupSmartspace() {
+        if (smartspaceSession != null) return
+
         // Step 1: ensure ACCESS_SMARTSPACE is granted
         if (!ShizukuHelper.hasAccessSmartspace(this)) {
             val granted = ShizukuHelper.grantAccessSmartspace(packageName)
@@ -171,13 +173,20 @@ class SmartspaceBridgeService : Service() {
             val featureType = runCatching {
                 target.javaClass.getMethod("getFeatureType").invoke(target)
             }.getOrNull()
-            val templateType = runCatching {
-                target.javaClass.getMethod("getTemplateData").invoke(target)?.javaClass?.simpleName
-            }.getOrNull() ?: "null"
-            val headerTitle = textFromAction(target, "getHeaderAction")
-            val baseTitle   = textFromAction(target, "getBaseAction")
+            val templateData = runCatching {
+                target.javaClass.getMethod("getTemplateData").invoke(target)
+            }.getOrNull()
+            val templateType = templateData?.javaClass?.simpleName ?: "null"
+            val primaryItem  = textFromSubItem(templateData, "getPrimaryItem")
+            val subtitleItem = textFromSubItem(templateData, "getSubtitleItem")
+            val headerTitle  = textFromAction(target, "getHeaderAction")
+            val headerSub    = textFromActionSubtitle(target, "getHeaderAction")
+            val baseTitle    = textFromAction(target, "getBaseAction")
+            val baseSub      = textFromActionSubtitle(target, "getBaseAction")
             Log.d(TAG, "Target[$i] featureType=$featureType templateData=$templateType " +
-                    "headerTitle='$headerTitle' baseTitle='$baseTitle'")
+                    "primary='$primaryItem' subtitle='$subtitleItem' " +
+                    "headerTitle='$headerTitle' headerSub='$headerSub' " +
+                    "baseTitle='$baseTitle' baseSub='$baseSub'")
         }
 
         // Collect all FEATURE_CALENDAR targets with their extracted titles
@@ -222,14 +231,22 @@ class SmartspaceBridgeService : Service() {
                 val templateData = runCatching {
                     target.javaClass.getMethod("getTemplateData").invoke(target)
                 }.getOrNull()
-                val title = textFromSubItem(templateData, "getPrimaryItem")
-                    ?: textFromAction(target, "getHeaderAction")
-                    ?: textFromAction(target, "getBaseAction")
-                if (title.isNullOrEmpty()) return@mapNotNull null
-                val subtitle = textFromSubItem(templateData, "getSubtitleItem")
-                    ?: textFromActionSubtitle(target, "getHeaderAction")
-                    ?: textFromActionSubtitle(target, "getBaseAction")
-                    ?: ""
+                // Smartspacer uses two distinct rendering paths that must not be mixed:
+                //   Template path (templateData != null): primaryItem = main line,
+                //     subtitleItem = second line. For weather+date: primary=date, subtitle=temp.
+                //   Feature path (templateData == null): headerAction.title = main line,
+                //     headerAction.subtitle = second line. Used by commute, image cards, etc.
+                // Mixing paths causes duplicates (e.g. headerAction.title carries temperature
+                // for weather cards, not the date, so falling through gives "16°C / 16°C").
+                val (title, subtitle) = if (templateData != null) {
+                    val t = textFromSubItem(templateData, "getPrimaryItem") ?: return@mapNotNull null
+                    val s = textFromSubItem(templateData, "getSubtitleItem") ?: ""
+                    Pair(t, s)
+                } else {
+                    val t = textFromAction(target, "getHeaderAction") ?: return@mapNotNull null
+                    val s = textFromActionSubtitle(target, "getHeaderAction") ?: ""
+                    Pair(t, s)
+                }
                 CalendarEvent(title = title, subtitle = subtitle)
             }.firstOrNull()
 
