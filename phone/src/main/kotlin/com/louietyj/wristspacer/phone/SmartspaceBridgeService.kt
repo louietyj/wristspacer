@@ -22,10 +22,20 @@ import java.util.concurrent.Executors
 class SmartspaceBridgeService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    // Privileged ASI session (Shizuku path — sees all targets including commute)
-    private var asiSession: AsiSmartspaceSession? = null
-    // Fallback SmartspaceManager session (only used if Shizuku is unavailable)
+
+    // SmartspaceManager session — always runs; hooks into Smartspacer when it is the active
+    // Smartspace service provider, giving us weather+date and calendar targets.
     private var smartspaceSession: Any? = null
+
+    // Privileged ASI session — runs in parallel when Shizuku is available; watches exclusively
+    // for commute cards (featureType=3) that SmartspaceManager filters out. When a commute card
+    // is present it overrides the watch display; when it clears we revert to SmartspaceManager.
+    private var asiSession: AsiSmartspaceSession? = null
+
+    // True while the ASI session has seen a current commute card.
+    // SmartspaceManager callbacks are suppressed while this is true.
+    @Volatile private var commuteActive = false
+
     private lateinit var dataClient: DataClient
 
     // -------------------------------------------------------------------------
@@ -48,7 +58,7 @@ class SmartspaceBridgeService : Service() {
     override fun onDestroy() {
         asiSession?.destroy()
         asiSession = null
-        destroySession()
+        destroySmartspaceManagerSession()
         scope.cancel()
         AppState.updateBridgeStatus(BridgeStatus.Stopped)
         super.onDestroy()
@@ -61,7 +71,7 @@ class SmartspaceBridgeService : Service() {
     // -------------------------------------------------------------------------
 
     private fun setupSmartspace() {
-        // Step 1: ensure ACCESS_SMARTSPACE is granted (needed for the fallback path)
+        // Step 1: ensure ACCESS_SMARTSPACE is granted (required for SmartspaceManager).
         if (!ShizukuHelper.hasAccessSmartspace(this)) {
             val granted = ShizukuHelper.grantAccessSmartspace(packageName)
             if (!granted) {
@@ -70,40 +80,39 @@ class SmartspaceBridgeService : Service() {
             }
         }
 
-        // Step 2: proactively apply the hidden_api_policy=1 fallback via Shizuku.
-        // The VMRuntime double-reflection bypass can fail on Android 16; this is the
-        // belt-and-suspenders approach that doesn't require a reboot to take effect.
+        // Step 2: apply hidden_api_policy=1 so reflection on hidden APIs works reliably.
         ShizukuHelper.applyHiddenApiPolicyViaShizuku()
 
-        // Step 3: primary path — direct ISmartspaceService bind via Shizuku (shell UID).
-        // This sees ALL Smartspace targets including featureType=3 (commute cards), which
-        // the public SmartspaceManager filters out for non-system callers.
-        if (ShizukuHelper.isReady()) {
-            // Guard against duplicate starts (onStartCommand may fire more than once).
-            if (asiSession != null) {
-                Log.d(TAG, "ASI session already active — skipping duplicate setup")
-                return
-            }
-            Log.d(TAG, "Shizuku available — using privileged ASI session")
+        // Step 3: SmartspaceManager session — the primary data source.
+        // When Smartspacer is the active Smartspace service (set via `cmd smartspace
+        // set temporary-service`), this session receives Smartspacer's enriched targets:
+        // weather+date, calendar events, and any other plugins Smartspacer has configured.
+        // Guard against duplicate onStartCommand calls.
+        if (smartspaceSession == null) {
+            setupSmartspaceManagerSession()
+        } else {
+            Log.d(TAG, "SmartspaceManager session already active — skipping duplicate setup")
+        }
+
+        // Step 4: ASI direct session — commute-card-only override.
+        // Runs alongside the SmartspaceManager session when Shizuku is available.
+        // It does NOT replace SmartspaceManager; it only pushes to the watch when it sees
+        // featureType=3 (commute). When commute clears it triggers a SmartspaceManager refresh.
+        if (ShizukuHelper.isReady() && asiSession == null) {
+            Log.d(TAG, "Shizuku available — starting ASI commute watcher")
             val session = AsiSmartspaceSession(this, scope) { targets ->
-                processTargets(targets)
+                onAsiTargets(targets)
             }
             asiSession = session
             session.start()
-            // Status is updated to Running by AsiSmartspaceSession once the ASI session
-            // is established and the first target batch arrives. We return here and let
-            // callbacks drive the rest of the lifecycle.
-            return
         }
-
-        // Step 4 (fallback): SmartspaceManager session — no commute card, but still useful
-        // when Shizuku is absent.
-        Log.w(TAG, "Shizuku not ready — falling back to SmartspaceManager (no commute card)")
-        setupSmartspaceManagerFallback()
     }
 
-    private fun setupSmartspaceManagerFallback() {
-        // Confirm SmartspaceManager class is visible
+    // -------------------------------------------------------------------------
+    // SmartspaceManager session
+    // -------------------------------------------------------------------------
+
+    private fun setupSmartspaceManagerSession() {
         try {
             Class.forName("android.app.smartspace.SmartspaceManager")
         } catch (e: ClassNotFoundException) {
@@ -111,14 +120,12 @@ class SmartspaceBridgeService : Service() {
             return
         }
 
-        // Get the SmartspaceManager instance
         val manager: Any = getSystemService("smartspace") ?: run {
-            fail("getSystemService(smartspace) returned null even after hidden_api_policy=1.\n" +
-                 "Run manually: adb shell settings put global hidden_api_policy 1")
+            fail("getSystemService(smartspace) returned null — run: " +
+                 "adb shell settings put global hidden_api_policy 1")
             return
         }
 
-        // Build SmartspaceConfig via reflection
         val config = try {
             val builderClass = Class.forName("android.app.smartspace.SmartspaceConfig\$Builder")
             val builder = builderClass
@@ -131,10 +138,9 @@ class SmartspaceBridgeService : Service() {
             return
         }
 
-        // Create SmartspaceSession
         val session = try {
             val managerClass = Class.forName("android.app.smartspace.SmartspaceManager")
-            val configClass = Class.forName("android.app.smartspace.SmartspaceConfig")
+            val configClass  = Class.forName("android.app.smartspace.SmartspaceConfig")
             managerClass.getMethod("createSmartspaceSession", configClass).invoke(manager, config)
         } catch (e: Exception) {
             fail("Failed to create SmartspaceSession: ${e.message}")
@@ -142,8 +148,7 @@ class SmartspaceBridgeService : Service() {
         }
         smartspaceSession = session
 
-        // Register listener via dynamic proxy
-        val sessionClass = Class.forName("android.app.smartspace.SmartspaceSession")
+        val sessionClass      = Class.forName("android.app.smartspace.SmartspaceSession")
         val listenerInterface = Class.forName(
             "android.app.smartspace.SmartspaceSession\$OnTargetsAvailableListener"
         )
@@ -153,13 +158,14 @@ class SmartspaceBridgeService : Service() {
             arrayOf(listenerInterface)
         ) { proxy, method, args ->
             // SmartspaceSession stores the listener in an ArrayMap keyed by hashCode,
-            // so the proxy MUST return a valid int from hashCode() — null causes an NPE
-            // when the runtime tries to unbox it to a primitive int.
+            // so the proxy MUST return a valid int — null causes an NPE on unboxing.
             when (method.name) {
                 "onTargetsAvailable" -> {
-                    if (args != null) {
+                    if (args != null && !commuteActive) {
+                        // Commute card from ASI is showing — don't let SmartspaceManager
+                        // data overwrite it mid-commute.
                         @Suppress("UNCHECKED_CAST")
-                        processTargets(args[0] as List<Any?>)
+                        processSmartspacerTargets(args[0] as List<Any?>)
                     }
                     null
                 }
@@ -178,140 +184,189 @@ class SmartspaceBridgeService : Service() {
         ).invoke(session, executor, listenerProxy)
 
         sessionClass.getMethod("requestSmartspaceUpdate").invoke(session)
-
-        Log.d(TAG, "SmartspaceManager fallback session created and listening")
+        Log.d(TAG, "SmartspaceManager session created and listening")
         AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
     }
 
+    /** Asks the SmartspaceManager session to re-deliver its current targets. */
+    private fun refreshSmartspaceManagerData() {
+        val session = smartspaceSession ?: return
+        try {
+            session.javaClass.getMethod("requestSmartspaceUpdate").invoke(session)
+        } catch (e: Exception) {
+            Log.w(TAG, "refreshSmartspaceManagerData: ${e.message}")
+        }
+    }
+
     // -------------------------------------------------------------------------
-    // Target processing
+    // ASI commute-card watcher callback
     // -------------------------------------------------------------------------
 
     /**
-     * Processes a batch of SmartspaceTargets from either the ASI direct session or the
-     * SmartspaceManager fallback.
-     *
-     * Priority:
-     *   1. FEATURE_COMMUTE  (featureType=3)  — commute card, ASI path only
-     *   2. FEATURE_CALENDAR (featureType=2)  — next calendar event
-     *   3. First target with any extractable title (fallback)
+     * Called by AsiSmartspaceSession when ASI delivers a new target batch.
+     * We look only for featureType=3 (commute). Everything else is handled by
+     * the SmartspaceManager/Smartspacer session.
      */
-    private fun processTargets(targets: List<Any?>) {
-        // Diagnostic: log every target's feature type and template data type so we can
-        // understand what Smartspace is actually returning when "none" appears.
-        targets.forEachIndexed { i, target ->
-            target ?: return@forEachIndexed
-            val featureType = runCatching {
-                target.javaClass.getMethod("getFeatureType").invoke(target)
-            }.getOrNull()
-            val templateType = runCatching {
-                target.javaClass.getMethod("getTemplateData").invoke(target)?.javaClass?.simpleName
-            }.getOrNull() ?: "null"
-            val headerTitle = textFromAction(target, "getHeaderAction")
-            val baseTitle   = textFromAction(target, "getBaseAction")
-            Log.d(TAG, "Target[$i] featureType=$featureType templateData=$templateType " +
-                    "headerTitle='$headerTitle' baseTitle='$baseTitle'")
+    private fun onAsiTargets(targets: List<Any?>) {
+        val commuteTarget = targets.firstOrNull { target ->
+            target ?: return@firstOrNull false
+            runCatching {
+                target.javaClass.getMethod("getFeatureType").invoke(target) as? Int
+            }.getOrNull() == FEATURE_COMMUTE
         }
 
-        data class Candidate(val target: Any, val featureType: Int, val title: String, val subtitle: String)
+        if (commuteTarget != null) {
+            val templateData = runCatching {
+                commuteTarget.javaClass.getMethod("getTemplateData").invoke(commuteTarget)
+            }.getOrNull()
 
-        // Collect FEATURE_COMMUTE (3) and FEATURE_CALENDAR (2) targets
-        val structuredCandidates = targets.mapNotNull { target ->
+            val title = textFromAction(commuteTarget, "getHeaderAction")
+                ?: textFromAction(commuteTarget, "getBaseAction")
+                ?: textFromSubItem(templateData, "getPrimaryItem")
+
+            if (title.isNullOrEmpty()) {
+                Log.w(TAG, "ASI commute target has no extractable title — ignoring")
+                return
+            }
+
+            val subtitle = textFromActionSubtitle(commuteTarget, "getHeaderAction")
+                ?: textFromActionSubtitle(commuteTarget, "getBaseAction")
+                ?: textFromSubItem(templateData, "getSubtitleItem")
+                ?: ""
+
+            val wasActive = commuteActive
+            commuteActive = true
+            Log.d(TAG, "ASI commute: '$title' / '$subtitle'${if (!wasActive) " (new)" else ""}")
+            val event = CalendarEvent(title = title, subtitle = subtitle)
+            AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
+            pushToWatch(event)
+
+        } else if (commuteActive) {
+            // Commute card just disappeared — revert to Smartspacer data.
+            Log.d(TAG, "ASI commute cleared — reverting to SmartspaceManager data")
+            commuteActive = false
+            refreshSmartspaceManagerData()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SmartspaceManager / Smartspacer target processing
+    // -------------------------------------------------------------------------
+
+    /**
+     * Processes a target batch from the SmartspaceManager session (which is
+     * Smartspacer's enriched output when Smartspacer is the active provider).
+     *
+     * Priority:
+     *   1. FEATURE_CALENDAR (featureType=2) — with [Mirror] deduplication
+     *   2. First target with any extractable title — whatever Smartspacer provides
+     *      (e.g. weather+date from its built-in sources)
+     */
+    private fun processSmartspacerTargets(targets: List<Any?>) {
+        Log.d(TAG, "processSmartspacerTargets: ${targets.size} targets")
+        targets.forEachIndexed { i, target ->
+            target ?: return@forEachIndexed
+            val featureType  = runCatching { target.javaClass.getMethod("getFeatureType").invoke(target) }.getOrNull()
+            val templateData = runCatching { target.javaClass.getMethod("getTemplateData").invoke(target) }.getOrNull()
+            val templateType = templateData?.javaClass?.simpleName ?: "null"
+            val hTitle = textFromAction(target, "getHeaderAction")
+            val bTitle = textFromAction(target, "getBaseAction")
+            Log.d(TAG, "Target[$i] featureType=$featureType templateData=$templateType " +
+                    "hTitle='$hTitle' bTitle='$bTitle'")
+        }
+
+        data class Candidate(val title: String, val subtitle: String)
+
+        // ── Calendar targets ──────────────────────────────────────────────────
+        val calendarCandidates = targets.mapNotNull { target ->
             target ?: return@mapNotNull null
             val featureType = runCatching {
                 target.javaClass.getMethod("getFeatureType").invoke(target) as? Int
-            }.getOrNull() ?: return@mapNotNull null
-
-            if (featureType != FEATURE_COMMUTE && featureType != FEATURE_CALENDAR) return@mapNotNull null
+            }.getOrNull()
+            if (featureType != FEATURE_CALENDAR) return@mapNotNull null
 
             val templateData = runCatching {
                 target.javaClass.getMethod("getTemplateData").invoke(target)
             }.getOrNull()
 
-            // Commute cards store the text in header/base actions; calendar in templateData sub-items
-            val title = when (featureType) {
-                FEATURE_COMMUTE -> textFromAction(target, "getHeaderAction")
-                    ?: textFromAction(target, "getBaseAction")
-                    ?: textFromSubItem(templateData, "getPrimaryItem")
-                else -> textFromSubItem(templateData, "getPrimaryItem")
-            } ?: return@mapNotNull null
-
-            val subtitle = when (featureType) {
-                FEATURE_COMMUTE -> textFromActionSubtitle(target, "getHeaderAction")
-                    ?: textFromActionSubtitle(target, "getBaseAction")
-                    ?: textFromSubItem(templateData, "getSubtitleItem")
-                    ?: ""
-                else -> textFromSubItem(templateData, "getSubtitleItem") ?: ""
-            }
-            Candidate(target, featureType, title, subtitle)
+            val title    = textFromSubItem(templateData, "getPrimaryItem")  ?: return@mapNotNull null
+            val subtitle = textFromSubItem(templateData, "getSubtitleItem") ?: ""
+            Candidate(title, subtitle)
         }
 
-        // Separate commute and calendar; commute takes priority
-        val commuteCandidates  = structuredCandidates.filter { it.featureType == FEATURE_COMMUTE }
-        val calendarCandidates = structuredCandidates.filter { it.featureType == FEATURE_CALENDAR }
-
-        // Commute card takes highest priority
-        val chosen: Candidate? = if (commuteCandidates.isNotEmpty()) {
-            commuteCandidates.first().also {
-                Log.d(TAG, "Commute card: '${it.title}' / '${it.subtitle}'")
+        // Remove [Mirror] X when X also exists — keeps only the canonical copy.
+        val deduped = if (calendarCandidates.isNotEmpty()) {
+            val nonMirroredTitles = calendarCandidates
+                .map { it.title }
+                .filter { !it.startsWith("[Mirror]", ignoreCase = true) }
+                .toSet()
+            calendarCandidates.filter { c ->
+                val stripped = c.title.removePrefix("[Mirror] ").removePrefix("[mirror] ")
+                !c.title.startsWith("[Mirror]", ignoreCase = true) || stripped !in nonMirroredTitles
             }
-        } else {
-            // Remove [Mirror] X when X also exists — then pick the first remaining calendar event.
-            val dedupedCalendar = if (calendarCandidates.isNotEmpty()) {
-                val nonMirroredTitles = calendarCandidates
-                    .map { it.title }
-                    .filter { !it.startsWith("[Mirror]", ignoreCase = true) }
-                    .toSet()
-                calendarCandidates.filter { c ->
-                    val stripped = c.title.removePrefix("[Mirror] ").removePrefix("[mirror] ")
-                    !c.title.startsWith("[Mirror]", ignoreCase = true) || stripped !in nonMirroredTitles
-                }
-            } else emptyList()
-            dedupedCalendar.firstOrNull()
-        }
+        } else emptyList()
 
-        if (chosen == null) {
-            // No calendar targets — iterate all targets until one yields an extractable title.
-            // Some targets (e.g. featureType=72 placeholders) have null templateData and null
-            // action titles; skipping them lets us reach the real content further down the list.
-            val fallbackEvent = targets.asSequence().filterNotNull().mapNotNull { target ->
-                val templateData = runCatching {
-                    target.javaClass.getMethod("getTemplateData").invoke(target)
-                }.getOrNull()
-                val title = textFromSubItem(templateData, "getPrimaryItem")
-                    ?: textFromAction(target, "getHeaderAction")
-                    ?: textFromAction(target, "getBaseAction")
-                if (title.isNullOrEmpty()) return@mapNotNull null
-                val rawSubtitle = textFromSubItem(templateData, "getSubtitleItem")
-                    ?: textFromActionSubtitle(target, "getHeaderAction")
-                    ?: textFromActionSubtitle(target, "getBaseAction")
-                    ?: ""
-                // Suppress subtitle when it duplicates the title (e.g. weather cards where
-                // ASI sets both headerAction.title and headerAction.subtitle to the temperature).
-                val subtitle = if (rawSubtitle == title) "" else rawSubtitle
-                CalendarEvent(title = title, subtitle = subtitle)
-            }.firstOrNull()
+        val chosen: Candidate? = deduped.firstOrNull()
 
-            if (fallbackEvent == null) {
-                Log.w(TAG, "No target yielded an extractable title — clearing")
-                AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
-                pushToWatch(null)
-                return
-            }
-            Log.d(TAG, "Fallback event: '${fallbackEvent.title}' / '${fallbackEvent.subtitle}'")
-            AppState.updateBridgeStatus(BridgeStatus.Running(event = fallbackEvent))
-            pushToWatch(fallbackEvent)
+        if (chosen != null) {
+            Log.d(TAG, "Calendar event: '${chosen.title}' / '${chosen.subtitle}'")
+            val event = CalendarEvent(title = chosen.title, subtitle = chosen.subtitle)
+            AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
+            pushToWatch(event)
             return
         }
 
-        val label = if (chosen.featureType == FEATURE_COMMUTE) "Commute" else "Calendar"
-        Log.d(TAG, "$label event: '${chosen.title}' / '${chosen.subtitle}'")
-        val event = CalendarEvent(title = chosen.title, subtitle = chosen.subtitle)
+        // ── No calendar — use whatever Smartspacer provides ───────────────────
+        // Skip placeholder targets (null content) and take the first one that
+        // has any extractable title. This is Smartspacer's enriched data —
+        // weather+date, clock targets, etc.
+        //
+        // Extraction priority for Smartspacer's combined featureType=0 target:
+        //   title:    headerAction.title (e.g. "21°C") — the primary data value
+        //   subtitle: primaryItem / baseAction.title   (e.g. "Mon, Jun 1") — the label/context
+        // Fallbacks: subtitleItem, action subtitles.
+        val fallbackEvent = targets.asSequence().filterNotNull().mapNotNull { target ->
+            val templateData = runCatching {
+                target.javaClass.getMethod("getTemplateData").invoke(target)
+            }.getOrNull()
+
+            // headerAction carries the main data value (temperature, event title, etc.)
+            val title = textFromAction(target, "getHeaderAction")
+                ?: textFromSubItem(templateData, "getPrimaryItem")
+                ?: textFromAction(target, "getBaseAction")
+            if (title.isNullOrEmpty()) return@mapNotNull null
+
+            // Subtitle: prefer primaryItem / baseAction (contextual labels like date/location),
+            // then fall back to templateData subtitle / action subtitles.
+            // Always suppress if it would duplicate the title.
+            val rawSubtitle = listOfNotNull(
+                textFromSubItem(templateData, "getPrimaryItem"),
+                textFromAction(target, "getBaseAction"),
+                textFromSubItem(templateData, "getSubtitleItem"),
+                textFromActionSubtitle(target, "getHeaderAction"),
+                textFromActionSubtitle(target, "getBaseAction"),
+            ).firstOrNull { it != title } ?: ""
+            Candidate(title, rawSubtitle)
+        }.firstOrNull()
+
+        if (fallbackEvent == null) {
+            Log.w(TAG, "No usable Smartspacer target — clearing")
+            AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
+            pushToWatch(null)
+            return
+        }
+
+        Log.d(TAG, "Smartspacer fallback: '${fallbackEvent.title}' / '${fallbackEvent.subtitle}'")
+        val event = CalendarEvent(title = fallbackEvent.title, subtitle = fallbackEvent.subtitle)
         AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
         pushToWatch(event)
     }
 
-    /** Extracts text from templateData → subItemGetter() → getText() → getText(). */
+    // -------------------------------------------------------------------------
+    // Shared text-extraction helpers (used by both paths)
+    // -------------------------------------------------------------------------
+
+    /** Extracts text from templateData.subItemGetter().getText().getText(). */
     private fun textFromSubItem(templateData: Any?, subItemGetter: String): String? = runCatching {
         val subItem = templateData?.javaClass?.getMethod(subItemGetter)?.invoke(templateData)
             ?: return@runCatching null
@@ -320,14 +375,14 @@ class SmartspaceBridgeService : Service() {
         textObj.javaClass.getMethod("getText").invoke(textObj)?.toString()?.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
-    /** Extracts the title string from a SmartspaceAction on the target (header or base). */
+    /** Extracts SmartspaceAction.getTitle() from a named action getter on the target. */
     private fun textFromAction(target: Any, actionGetter: String): String? = runCatching {
         val action = target.javaClass.getMethod(actionGetter).invoke(target)
             ?: return@runCatching null
         action.javaClass.getMethod("getTitle").invoke(action)?.toString()?.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
-    /** Extracts the subtitle string from a SmartspaceAction on the target (header or base). */
+    /** Extracts SmartspaceAction.getSubtitle() from a named action getter on the target. */
     private fun textFromActionSubtitle(target: Any, actionGetter: String): String? = runCatching {
         val action = target.javaClass.getMethod(actionGetter).invoke(target)
             ?: return@runCatching null
@@ -365,12 +420,12 @@ class SmartspaceBridgeService : Service() {
     // Cleanup
     // -------------------------------------------------------------------------
 
-    private fun destroySession() {
+    private fun destroySmartspaceManagerSession() {
         val session = smartspaceSession ?: return
         try {
             session.javaClass.getMethod("destroy").invoke(session)
         } catch (e: Exception) {
-            Log.w(TAG, "destroySession: ${e.message}")
+            Log.w(TAG, "destroySmartspaceManagerSession: ${e.message}")
         }
         smartspaceSession = null
     }

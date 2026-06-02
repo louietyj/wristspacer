@@ -222,7 +222,6 @@ class AsiSmartspaceSession(
 
         Log.i(TAG, "ASI session live — surface=$SURFACE_HOME, " +
                 "callerPackage=${context.packageName}")
-        AppState.updateBridgeStatus(BridgeStatus.Running(event = null))
     }
 
     private fun destroyAsiSession() {
