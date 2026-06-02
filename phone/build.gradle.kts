@@ -33,6 +33,7 @@ android {
 
     buildFeatures {
         compose = true
+        aidl = true
     }
     // No composeOptions needed with Kotlin 2.x — the compiler is bundled via kotlin.compose plugin
 }
