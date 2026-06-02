@@ -282,10 +282,13 @@ class SmartspaceBridgeService : Service() {
                     ?: textFromAction(target, "getHeaderAction")
                     ?: textFromAction(target, "getBaseAction")
                 if (title.isNullOrEmpty()) return@mapNotNull null
-                val subtitle = textFromSubItem(templateData, "getSubtitleItem")
+                val rawSubtitle = textFromSubItem(templateData, "getSubtitleItem")
                     ?: textFromActionSubtitle(target, "getHeaderAction")
                     ?: textFromActionSubtitle(target, "getBaseAction")
                     ?: ""
+                // Suppress subtitle when it duplicates the title (e.g. weather cards where
+                // ASI sets both headerAction.title and headerAction.subtitle to the temperature).
+                val subtitle = if (rawSubtitle == title) "" else rawSubtitle
                 CalendarEvent(title = title, subtitle = subtitle)
             }.firstOrNull()
 
