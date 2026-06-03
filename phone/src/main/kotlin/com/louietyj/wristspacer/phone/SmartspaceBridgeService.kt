@@ -227,7 +227,9 @@ class SmartspaceBridgeService : Service() {
                         }.getOrNull() ?: return@mapNotNull null
                         val texts = extractDrawInstructionsTexts(rv)
                         if (texts.isEmpty()) return@mapNotNull null
-                        Pair(texts[0], texts.getOrElse(1) { "" })
+                        val longer  = texts.maxByOrNull { it.length }!!
+                        val shorter = texts.firstOrNull { it !== longer } ?: ""
+                        Pair(longer, shorter)
                     }
                 }
                 CalendarEvent(title = title, subtitle = subtitle)
