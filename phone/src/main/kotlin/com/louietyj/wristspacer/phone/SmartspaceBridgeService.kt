@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import android.widget.RemoteViews
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
@@ -166,8 +167,6 @@ class SmartspaceBridgeService : Service() {
      * We try baseAction first, then headerAction, and log everything for diagnostics.
      */
     private fun processTargets(targets: List<Any?>) {
-        // Diagnostic: log every target's feature type and template data type so we can
-        // understand what Smartspace is actually returning when "none" appears.
         targets.forEachIndexed { i, target ->
             target ?: return@forEachIndexed
             val featureType = runCatching {
@@ -187,6 +186,7 @@ class SmartspaceBridgeService : Service() {
                     "primary='$primaryItem' subtitle='$subtitleItem' " +
                     "headerTitle='$headerTitle' headerSub='$headerSub' " +
                     "baseTitle='$baseTitle' baseSub='$baseSub'")
+
         }
 
         // Collect all FEATURE_CALENDAR targets with their extracted titles
@@ -239,13 +239,25 @@ class SmartspaceBridgeService : Service() {
                 // Mixing paths causes duplicates (e.g. headerAction.title carries temperature
                 // for weather cards, not the date, so falling through gives "16°C / 16°C").
                 val (title, subtitle) = if (templateData != null) {
+                    // Template path: primaryItem / subtitleItem
                     val t = textFromSubItem(templateData, "getPrimaryItem") ?: return@mapNotNull null
                     val s = textFromSubItem(templateData, "getSubtitleItem") ?: ""
                     Pair(t, s)
                 } else {
-                    val t = textFromAction(target, "getHeaderAction") ?: return@mapNotNull null
-                    val s = textFromActionSubtitle(target, "getHeaderAction") ?: ""
-                    Pair(t, s)
+                    val headerTitle = textFromAction(target, "getHeaderAction")
+                    if (headerTitle != null) {
+                        // Feature path: headerAction has plain text
+                        val s = textFromActionSubtitle(target, "getHeaderAction") ?: ""
+                        Pair(headerTitle, s)
+                    } else {
+                        // DrawInstructions path: text is baked into RemoteViews binary (commute card)
+                        val rv = runCatching {
+                            target.javaClass.getMethod("getRemoteViews").invoke(target) as? RemoteViews
+                        }.getOrNull() ?: return@mapNotNull null
+                        val texts = extractDrawInstructionsTexts(rv)
+                        if (texts.isEmpty()) return@mapNotNull null
+                        Pair(texts[0], texts.getOrElse(1) { "" })
+                    }
                 }
                 CalendarEvent(title = title, subtitle = subtitle)
             }.firstOrNull()
@@ -266,6 +278,79 @@ class SmartspaceBridgeService : Service() {
         val event = CalendarEvent(title = chosen.title, subtitle = chosen.subtitle)
         AppState.updateBridgeStatus(BridgeStatus.Running(event = event))
         pushToWatch(event)
+    }
+
+    // -------------------------------------------------------------------------
+    // DrawInstructions text extraction
+    // -------------------------------------------------------------------------
+
+    /**
+     * Walks a RemoteViews action tree looking for SetDrawInstructionAction, which wraps a
+     * RemoteCompose binary document. Text strings are stored as TextData operations (opcode 102)
+     * inside that document and are accessible via reflection on the parsed operation list.
+     *
+     * Uses identity-hash cycle detection + depth cap to avoid infinite loops in nested trees.
+     */
+    private fun extractDrawInstructionsTexts(rv: RemoteViews): List<String> {
+        val out = mutableListOf<String>()
+        walkForDrawInstructions(rv, HashSet(), out, 0)
+        return out
+    }
+
+    private fun walkForDrawInstructions(
+        rv: RemoteViews,
+        visited: HashSet<Int>,
+        out: MutableList<String>,
+        depth: Int
+    ) {
+        if (depth > 30 || !visited.add(System.identityHashCode(rv))) return
+        val actions = runCatching {
+            rv.javaClass.getDeclaredField("mActions").also { it.isAccessible = true }.get(rv) as? List<*>
+        }.getOrNull() ?: return
+
+        for (action in actions) {
+            action ?: continue
+            when (action.javaClass.simpleName) {
+                "ReflectionAction" -> {
+                    // Text is stored in BaseReflectionAction.mMethodName / ReflectionAction.mValue.
+                    // Both fields may live in a superclass of the concrete action class.
+                    val methodName = findField(action, "mMethodName") as? String
+                    if (methodName == "setText") {
+                        val value = findField(action, "mValue")?.toString()
+                        if (!value.isNullOrBlank()) out.add(value)
+                    }
+                }
+                "ViewGroupActionAdd" -> {
+                    // Find nested RemoteViews — field is "nestedViews" in AOSP; scan all fields
+                    // in case it's been renamed in the OEM build.
+                    var nested: RemoteViews? = runCatching {
+                        action.javaClass.getDeclaredField("nestedViews")
+                            .also { it.isAccessible = true }.get(action) as? RemoteViews
+                    }.getOrNull()
+                    if (nested == null) {
+                        outer@ for (cls in generateSequence(action.javaClass) { it.superclass }) {
+                            for (f in cls.declaredFields) {
+                                val v = runCatching { f.also { it.isAccessible = true }.get(action) }.getOrNull()
+                                if (v is RemoteViews) { nested = v; break@outer }
+                            }
+                        }
+                    }
+                    nested?.let { walkForDrawInstructions(it, visited, out, depth + 1) }
+                }
+            }
+        }
+    }
+
+    /** Walks [obj]'s class hierarchy (including superclasses) to find and read a declared field. */
+    private fun findField(obj: Any, name: String): Any? {
+        var cls: Class<*>? = obj.javaClass
+        while (cls != null && cls != Any::class.java) {
+            try {
+                return cls.getDeclaredField(name).also { it.isAccessible = true }.get(obj)
+            } catch (_: NoSuchFieldException) {}
+            cls = cls.superclass
+        }
+        return null
     }
 
     /** Extracts text from templateData → subItemGetter() → getText() → getText(). */
