@@ -158,36 +158,7 @@ class SmartspaceBridgeService : Service() {
     // Target processing
     // -------------------------------------------------------------------------
 
-    /**
-     * Finds the first FEATURE_CALENDAR target (featureType == 2) and extracts the event
-     * title and time. SmartspaceTarget layout for calendar events:
-     *   baseAction.title    = event title  (e.g. "Weekly Standup")
-     *   baseAction.subtitle = location / organiser (optional)
-     *   headerAction.title  = time string  (e.g. "10:00 AM") — often empty on some builds
-     * We try baseAction first, then headerAction, and log everything for diagnostics.
-     */
     private fun processTargets(targets: List<Any?>) {
-        targets.forEachIndexed { i, target ->
-            target ?: return@forEachIndexed
-            val featureType = runCatching {
-                target.javaClass.getMethod("getFeatureType").invoke(target)
-            }.getOrNull()
-            val templateData = runCatching {
-                target.javaClass.getMethod("getTemplateData").invoke(target)
-            }.getOrNull()
-            val templateType = templateData?.javaClass?.simpleName ?: "null"
-            val primaryItem  = textFromSubItem(templateData, "getPrimaryItem")
-            val subtitleItem = textFromSubItem(templateData, "getSubtitleItem")
-            val headerTitle  = textFromAction(target, "getHeaderAction")
-            val headerSub    = textFromActionSubtitle(target, "getHeaderAction")
-            val baseTitle    = textFromAction(target, "getBaseAction")
-            val baseSub      = textFromActionSubtitle(target, "getBaseAction")
-            Log.d(TAG, "Target[$i] featureType=$featureType templateData=$templateType " +
-                    "primary='$primaryItem' subtitle='$subtitleItem' " +
-                    "headerTitle='$headerTitle' headerSub='$headerSub' " +
-                    "baseTitle='$baseTitle' baseSub='$baseSub'")
-
-        }
 
         // Collect all FEATURE_CALENDAR targets with their extracted titles
         data class Candidate(val target: Any, val title: String, val subtitle: String)
