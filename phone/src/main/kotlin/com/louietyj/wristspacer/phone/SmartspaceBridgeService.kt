@@ -159,6 +159,30 @@ class SmartspaceBridgeService : Service() {
     // -------------------------------------------------------------------------
 
     private fun processTargets(targets: List<Any?>) {
+        targets.forEachIndexed { i, target ->
+            target ?: return@forEachIndexed
+            val featureType = runCatching {
+                target.javaClass.getMethod("getFeatureType").invoke(target)
+            }.getOrNull()
+            val templateData = runCatching {
+                target.javaClass.getMethod("getTemplateData").invoke(target)
+            }.getOrNull()
+            val templateType = templateData?.javaClass?.simpleName ?: "null"
+            val primary  = textFromSubItem(templateData, "getPrimaryItem")
+            val subtitle = textFromSubItem(templateData, "getSubtitleItem")
+            val headerT  = textFromAction(target, "getHeaderAction")
+            val headerS  = textFromActionSubtitle(target, "getHeaderAction")
+            val baseT    = textFromAction(target, "getBaseAction")
+            val baseS    = textFromActionSubtitle(target, "getBaseAction")
+            val rvTexts  = runCatching {
+                (target.javaClass.getMethod("getRemoteViews").invoke(target) as? RemoteViews)
+                    ?.let { extractDrawInstructionsTexts(it) }
+            }.getOrNull()
+            Log.d(TAG, "Target[$i] ft=$featureType tpl=$templateType " +
+                    "primary='$primary' subt='$subtitle' " +
+                    "hdrT='$headerT' hdrS='$headerS' baseT='$baseT' baseS='$baseS' " +
+                    "rvTexts=$rvTexts")
+        }
 
         // Collect all FEATURE_CALENDAR targets with their extracted titles
         data class Candidate(val target: Any, val title: String, val subtitle: String)
