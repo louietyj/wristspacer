@@ -56,6 +56,7 @@ class SmartspaceBridgeService : Service() {
     // Smartspace session setup — all reflection, no stubs needed
     // -------------------------------------------------------------------------
 
+    @Synchronized
     private fun setupSmartspace() {
         if (smartspaceSession != null) return
 
@@ -127,6 +128,8 @@ class SmartspaceBridgeService : Service() {
             // when the runtime tries to unbox it to a primitive int.
             when (method.name) {
                 "onTargetsAvailable" -> {
+                    val count = (args?.getOrNull(0) as? List<*>)?.size ?: 0
+                    Log.d(TAG, "onTargetsAvailable: $count targets")
                     if (args != null) {
                         @Suppress("UNCHECKED_CAST")
                         processTargets(args[0] as List<Any?>)
